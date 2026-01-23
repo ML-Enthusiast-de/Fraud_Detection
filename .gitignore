@@ -1,0 +1,94 @@
+# ----------------------------
+# OS / Editor
+# ----------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+
+# ----------------------------
+# Python
+# ----------------------------
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+
+# ----------------------------
+# Data (NEVER commit)
+# ----------------------------
+data/**
+!data/.gitkeep
+# If you later want to commit tiny sample data, we can allow e.g.:
+# !data/samples/**
+
+# ----------------------------
+# Model artifacts / outputs
+# ----------------------------
+artifacts/**
+outputs/**
+runs/**
+mlruns/**        # MLflow
+wandb/**         # Weights & Biases
+logs/**
+tmp/**
+*.log
+
+# ----------------------------
+# Large files
+# ----------------------------
+*.parquet
+*.csv
+*.feather
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+*.onnx
+
+# ----------------------------
+# Secrets
+# ----------------------------
+.env
+.env.*
+**/secrets.*
+**/*key*
+**/*token*
+**/*credentials*
+*.pem
+*.p12
+*.pfx
+
+# ----------------------------
+# Docker / misc
+# ----------------------------
+*.tar
+*.gz
+*.zip
