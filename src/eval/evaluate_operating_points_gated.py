@@ -9,62 +9,15 @@ import pandas as pd
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names*")
 
-
+# =========================
+# CONFIG
+# =========================
+MODEL_VARIANT = "behavioral"  # "behavioral" or "full"
 ALLOWED_TYPES = {"TRANSFER", "CASH_OUT"}  # stage-0 gate
-
-
-def load_scores(repo_root: Path):
-    import joblib
-
-    data_path = repo_root / "data" / "processed" / "paysim_with_temporal_graph_features.parquet"
-    model_path = repo_root / "artifacts" / "temporal_graph_lgbm.joblib"
-
-    if not data_path.exists():
-        raise FileNotFoundError(f"Missing {data_path}. Run feature builder first.")
-    if not model_path.exists():
-        raise FileNotFoundError(f"Missing {model_path}. Train temporal graph model first.")
-
-    df = pd.read_parquet(data_path).sort_values("step").reset_index(drop=True)
-
-    # same split logic as training: 70/15/15
-    n = len(df)
-    i2 = int(0.85 * n)
-    test_df = df.iloc[i2:].copy()
-
-    base_cols = [
-        "step", "type", "amount",
-        "oldbalanceOrg", "newbalanceOrig",
-        "oldbalanceDest", "newbalanceDest",
-    ]
-    graph_cols = [
-        "orig_out_cnt_24h", "orig_out_sum_24h",
-        "orig_out_cnt_7d", "orig_out_sum_7d",
-        "orig_distinct_dest_7d",
-        "dest_in_cnt_24h", "dest_in_sum_24h",
-        "dest_in_cnt_7d", "dest_in_sum_7d",
-        "dest_distinct_orig_7d",
-        "pair_cnt_7d",
-        "is_new_counterparty_30d",
-    ]
-    feature_cols = base_cols + graph_cols
-
-    X_test = test_df[feature_cols]
-    y_test = test_df["isFraud"].astype(int).values
-
-    pipe = joblib.load(model_path)
-    proba = pipe.predict_proba(X_test)
-    fraud_col = list(pipe.named_steps["model"].classes_).index(1)
-    s_test = proba[:, fraud_col]
-
-    return test_df, y_test, s_test
+# =========================
 
 
 def operating_point_under_fpr(y_true: np.ndarray, y_score: np.ndarray, target_fpr: float):
-    """
-    Rank-based operating point:
-    choose max recall such that FPR <= target_fpr.
-    Returns: (recall, precision, threshold, k_flagged)
-    """
     order = np.argsort(-y_score)
     y = y_true[order]
     s = y_score[order]
@@ -88,9 +41,7 @@ def operating_point_under_fpr(y_true: np.ndarray, y_score: np.ndarray, target_fp
         return 0.0, 0.0, float("inf"), 0
 
     j = valid[np.argmax(recall[valid])]
-    thr = float(s[j])
-    k = int(j + 1)
-    return float(recall[j]), float(precision[j]), thr, k
+    return float(recall[j]), float(precision[j]), float(s[j]), int(j + 1)
 
 
 def topk_capture(y_true: np.ndarray, y_score: np.ndarray, top_frac: float) -> dict:
@@ -113,6 +64,45 @@ def topk_capture(y_true: np.ndarray, y_score: np.ndarray, top_frac: float) -> di
     }
 
 
+def load_scores(repo_root: Path):
+    import joblib
+
+    data_path = repo_root / "data" / "processed" / "paysim_with_temporal_graph_features.parquet"
+    model_path = repo_root / "artifacts" / f"temporal_graph_{MODEL_VARIANT}_lgbm.joblib"
+
+    if not data_path.exists():
+        raise FileNotFoundError(f"Missing {data_path}. Run feature builder first.")
+    if not model_path.exists():
+        raise FileNotFoundError(f"Missing {model_path}. Train the {MODEL_VARIANT} model first.")
+
+    df = pd.read_parquet(data_path).sort_values("step").reset_index(drop=True)
+
+    # 70/15/15 split -> test is last 15%
+    n = len(df)
+    i2 = int(0.85 * n)
+    test_df = df.iloc[i2:].copy()
+
+    # If evaluating "full", compute balance anomaly columns (training expected them)
+    if MODEL_VARIANT == "full":
+        test_df["orig_delta"] = test_df["oldbalanceOrg"] - test_df["newbalanceOrig"]
+        test_df["dest_delta"] = test_df["newbalanceDest"] - test_df["oldbalanceDest"]
+        test_df["orig_error"] = (test_df["oldbalanceOrg"] - test_df["amount"]) - test_df["newbalanceOrig"]
+        test_df["dest_error"] = (test_df["oldbalanceDest"] + test_df["amount"]) - test_df["newbalanceDest"]
+        test_df["abs_orig_error"] = test_df["orig_error"].abs()
+        test_df["abs_dest_error"] = test_df["dest_error"].abs()
+
+    y_test = test_df["isFraud"].astype(int).values
+
+    pipe = joblib.load(model_path)
+
+    # Pass full df; ColumnTransformer will select needed columns by name.
+    proba = pipe.predict_proba(test_df)
+    fraud_col = list(pipe.named_steps["model"].classes_).index(1)
+    score = proba[:, fraud_col]
+
+    return test_df, y_test, score, model_path
+
+
 def run_eval(tag: str, test_df: pd.DataFrame, y_test: np.ndarray, score: np.ndarray):
     print(f"\n=== {tag} ===")
     print("Test rows:", len(y_test))
@@ -123,22 +113,15 @@ def run_eval(tag: str, test_df: pd.DataFrame, y_test: np.ndarray, score: np.ndar
     op_rows = []
     for fpr_t in fpr_targets:
         rec, prec, thr, k = operating_point_under_fpr(y_test, score, fpr_t)
-        op_rows.append({
-            "target_fpr": fpr_t,
-            "threshold": thr,
-            "k_flagged": k,
-            "recall": rec,
-            "precision": prec,
-        })
-    op_df = pd.DataFrame(op_rows)
+        op_rows.append({"target_fpr": fpr_t, "threshold": thr, "k_flagged": k, "recall": rec, "precision": prec})
+
     print("\nRecall at fixed FPR budgets:")
-    print(op_df.to_string(index=False))
+    print(pd.DataFrame(op_rows).to_string(index=False))
 
     top_fracs = [0.001, 0.002, 0.005, 0.01, 0.02]
     topk = [topk_capture(y_test, score, f) for f in top_fracs]
-    topk_df = pd.DataFrame(topk)
     print("\nTop-K capture (by score):")
-    print(topk_df.to_string(index=False))
+    print(pd.DataFrame(topk).to_string(index=False))
 
     tmp = test_df.copy()
     tmp["score"] = score
@@ -151,12 +134,12 @@ def run_eval(tag: str, test_df: pd.DataFrame, y_test: np.ndarray, score: np.ndar
 
 def main():
     repo_root = Path(__file__).resolve().parents[2]
-    test_df, y_test, s_test = load_scores(repo_root)
+    test_df, y_test, s_test, model_path = load_scores(repo_root)
 
-    # 1) Raw (no gate)
+    print(f"\nUsing model: {model_path}")
+
     report_raw = run_eval("RAW (no gating)", test_df, y_test, s_test)
 
-    # 2) Gated: only score TRANSFER/CASH_OUT, else score=0
     mask = test_df["type"].isin(ALLOWED_TYPES).values
     s_gated = s_test.copy()
     s_gated[~mask] = 0.0
@@ -164,11 +147,12 @@ def main():
     report_gated = run_eval(f"GATED (types in {sorted(ALLOWED_TYPES)})", test_df, y_test, s_gated)
 
     out = {
+        "model_variant": MODEL_VARIANT,
         "allowed_types": sorted(ALLOWED_TYPES),
         "raw": report_raw,
         "gated": report_gated,
     }
-    out_path = repo_root / "artifacts" / "operating_points_report_gated.json"
+    out_path = repo_root / "artifacts" / f"operating_points_report_gated_{MODEL_VARIANT}.json"
     out_path.write_text(json.dumps(out, indent=2))
     print(f"\nSaved: {out_path}")
 
