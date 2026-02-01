@@ -25,7 +25,7 @@ from torch_geometric.nn.models.tgn import (
 MODEL_VARIANT = "behavioral"  # prefix for artifacts
 
 BATCH_SIZE = 2000
-EPOCHS = 5
+EPOCHS = 15
 LR = 1e-3
 
 MEMORY_DIM = 128
@@ -33,7 +33,7 @@ TIME_DIM = 64
 HEADS = 2
 EMB_DIM = 128  # must be divisible by HEADS
 
-NEIGHBOR_SIZE = 50  # last-K neighbors per node
+NEIGHBOR_SIZE = 100  # last-K neighbors per node
 
 # Optional ops-style gate for reporting (does not affect training)
 ALLOWED_TYPES_GATE = {"TRANSFER", "CASH_OUT"}
