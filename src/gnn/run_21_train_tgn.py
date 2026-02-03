@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
-import math
 import random
 
 import numpy as np
@@ -23,10 +22,10 @@ from torch_geometric.nn.models.tgn import (
 # =========================
 # CONFIG (tune here)
 # =========================
-MODEL_VARIANT = "behavioral"   # artifact prefix; rename to "hybrid" if you want
+MODEL_VARIANT = "behavioral"   # rename to "hybrid" if you want
 
 BATCH_SIZE = 2000
-EPOCHS = 15
+EPOCHS = 25          # early stopping will stop earlier
 LR = 1e-3
 
 MEMORY_DIM = 128
@@ -34,17 +33,23 @@ TIME_DIM = 64
 HEADS = 2
 EMB_DIM = 128  # must be divisible by HEADS
 
-NEIGHBOR_SIZE = 50  # recommended default; 100 can dilute top-of-list on small positives
+NEIGHBOR_SIZE = 50   # good default on CPU; 100 can dilute top-of-list w/ few positives
 
-# Loss / optimization helpers
+# Regularization / stability
 CLIP_GRAD_NORM = 1.0
+WEIGHT_DECAY = 1e-4
 
-# Selection metric for checkpointing (rank-based, matches fraud ops)
-# Weighted recall at fixed FPR budgets on VAL
-SELECT_FPRS = (0.005, 0.01, 0.02)           # 0.5%, 1%, 2%
-SELECT_WEIGHTS = (0.5, 0.3, 0.2)            # must sum to 1 ideally
-EARLY_STOP_PATIENCE = 4                     # stop after N epochs w/o val score improvement
-MIN_EPOCHS_BEFORE_STOP = 3                  # don't stop too early
+# Focal loss for extreme imbalance
+USE_FOCAL = True
+FOCAL_GAMMA = 2.0
+
+# Checkpoint selection: weighted recall at fixed FPR budgets on VAL
+# (Slightly more stable than only low points because VAL has only 20 frauds.)
+SELECT_FPRS = (0.005, 0.01, 0.02, 0.05)      # 0.5%, 1%, 2%, 5%
+SELECT_WEIGHTS = (0.45, 0.25, 0.20, 0.10)    # sum to 1
+
+EARLY_STOP_PATIENCE = 6
+MIN_EPOCHS_BEFORE_STOP = 3
 
 # Optional ops-style gate for reporting (does NOT affect training)
 ALLOWED_TYPES_GATE = {"TRANSFER", "CASH_OUT"}
@@ -60,6 +65,32 @@ def seed_everything(seed: int = 42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def focal_bce_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    pos_weight: torch.Tensor,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    """
+    Focal loss on top of BCEWithLogits, with pos_weight for class imbalance.
+
+    - BCE focuses on fitting probabilities overall.
+    - Focal downweights "easy" examples (pt ~ 1), focuses on hard ones.
+    """
+    bce = F.binary_cross_entropy_with_logits(
+        logits, targets, pos_weight=pos_weight, reduction="none"
+    )  # [B]
+
+    p = torch.sigmoid(logits)
+    pt = torch.where(targets > 0.5, p, 1.0 - p)  # probability of the true class
+    mod = (1.0 - pt).pow(gamma)                  # downweight easy examples
+    return (mod * bce).mean()
 
 
 class TemporalGraphEmbedding(nn.Module):
@@ -108,7 +139,10 @@ def time_split(num_events: int):
 
 @torch.no_grad()
 def rank_recall_at_fpr(y_true: np.ndarray, score: np.ndarray, target_fpr: float):
-    """Rank-based operating point: choose top-k such that FPR <= target_fpr and recall is maximized."""
+    """
+    Rank-based operating point:
+    choose top-k such that FPR <= target_fpr and recall is maximized within that constraint.
+    """
     order = np.argsort(-score)
     y = y_true[order]
     s = score[order]
@@ -194,7 +228,7 @@ def main():
     classifier = EdgeClassifier(EMB_DIM, msg_dim).to(device)
 
     params = list(memory.parameters()) + list(embedder.parameters()) + list(classifier.parameters())
-    opt = torch.optim.Adam(params, lr=LR)
+    opt = torch.optim.Adam(params, lr=LR, weight_decay=WEIGHT_DECAY)
 
     # ---- Class imbalance ----
     y_train = train_data.y.cpu().numpy()
@@ -221,36 +255,35 @@ def main():
         Predict fraud logits for current batch WITHOUT updating memory with current batch.
         Uses neighborhood graph built from already-inserted edges.
         """
-        # Seed nodes we want neighborhoods for
         seed = torch.cat([batch.src, batch.dst]).unique()
 
         # PyG signature: __call__(n_id)
         n_id, edge_index, e_id = neighbor_loader(seed)
 
-        # Current memories for nodes in the sampled subgraph
         mem, _ = memory(n_id)
 
-        # If there are no neighbor edges yet, skip convolution and just use memory
         if edge_index.numel() == 0 or e_id.numel() == 0:
             z = mem
         else:
-            # Build edge_attr for neighborhood edges: [msg(edge), time_enc(age)]
-            e_t = batch.t_all[e_id]  # timestamps of stored edges
+            e_t = batch.t_all[e_id]
             age = (t_now - e_t).clamp_min(0).to(mem.dtype)
-            age_enc = memory.time_enc(age)            # [E, TIME_DIM]
-            e_msg = batch.msg_all[e_id]               # [E, msg_dim]
+            age_enc = memory.time_enc(age)         # [E, TIME_DIM]
+            e_msg = batch.msg_all[e_id]            # [E, msg_dim]
             e_attr = torch.cat([e_msg, age_enc], dim=-1)
 
             z = embedder(mem, edge_index, e_attr)
 
-        # Map global node ids -> local row indices in z
         assoc[n_id] = torch.arange(n_id.size(0), device=device)
-
         z_src = z[assoc[batch.src]]
         z_dst = z[assoc[batch.dst]]
 
         logits = classifier(z_src, z_dst, batch.msg)
         return logits
+
+    def compute_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if USE_FOCAL:
+            return focal_bce_with_logits(logits, targets, pos_weight=pos_weight, gamma=FOCAL_GAMMA)
+        return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
 
     def train_one_epoch(epoch: int):
         memory.train()
@@ -258,7 +291,7 @@ def main():
         classifier.train()
         reset_state()
 
-        # For training, e_id refers only to train inserts, so train-only arrays are fine
+        # During training, e_id indexes only into events inserted from the train stream
         train_t_all = train_data.t.to(device)
         train_msg_all = train_data.msg.to(device)
 
@@ -276,9 +309,7 @@ def main():
             t_now = batch.t.max()
             logits = batch_predict(batch, t_now)
 
-            loss = F.binary_cross_entropy_with_logits(
-                logits, batch.y.float(), pos_weight=pos_weight
-            )
+            loss = compute_loss(logits, batch.y.float())
             loss.backward()
 
             if CLIP_GRAD_NORM is not None and CLIP_GRAD_NORM > 0:
@@ -286,11 +317,10 @@ def main():
 
             opt.step()
 
-            # Update memory + neighbor store AFTER scoring
+            # Update AFTER scoring
             memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
             neighbor_loader.insert(batch.src, batch.dst)
 
-            # Detach to stop gradients through time
             memory.detach()
 
             bs = batch.num_events
@@ -304,8 +334,9 @@ def main():
         """
         Warm-up on history (build memory+neighbors), then score stream sequentially.
 
-        IMPORTANT: neighbor_loader keeps e_id in insertion order across history+stream,
-        so we must index e_id into combined arrays all_t/all_msg = cat(history, stream).
+        IMPORTANT:
+        neighbor_loader keeps e_id across history+stream inserts,
+        so we index into all_t/all_msg = cat(history, stream).
         """
         memory.eval()
         embedder.eval()
@@ -315,14 +346,14 @@ def main():
         all_t = torch.cat([history.t, stream.t]).to(device)
         all_msg = torch.cat([history.msg, stream.msg]).to(device)
 
-        # Warm-up: feed history only
+        # Warm-up on history
         history_loader = TemporalDataLoader(history, batch_size=BATCH_SIZE)
         for batch in history_loader:
             batch = batch.to(device)
             memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
             neighbor_loader.insert(batch.src, batch.dst)
 
-        # Score stream sequentially
+        # Score stream
         stream_loader = TemporalDataLoader(stream, batch_size=BATCH_SIZE)
 
         all_logits = []
@@ -348,7 +379,7 @@ def main():
         logits = torch.cat(all_logits).numpy()
         y_true = torch.cat(all_y).numpy().astype(np.int64)
         type_ids = torch.cat(all_type).numpy().astype(np.int64)
-        score = 1.0 / (1.0 + np.exp(-logits))
+        score = sigmoid_np(logits)
 
         def print_ops(tag: str, this_score: np.ndarray):
             print(f"\n=== {tag} ===")
@@ -383,12 +414,14 @@ def main():
     best_epoch = -1
     bad_epochs = 0
 
-    # Save config (once; we’ll also re-save inside checkpoint for reproducibility)
     base_config = {
         "MODEL_VARIANT": MODEL_VARIANT,
         "BATCH_SIZE": BATCH_SIZE,
         "EPOCHS": EPOCHS,
         "LR": LR,
+        "WEIGHT_DECAY": WEIGHT_DECAY,
+        "USE_FOCAL": USE_FOCAL,
+        "FOCAL_GAMMA": FOCAL_GAMMA,
         "MEMORY_DIM": MEMORY_DIM,
         "TIME_DIM": TIME_DIM,
         "HEADS": HEADS,
@@ -408,7 +441,6 @@ def main():
 
         val_out = eval_stream(train_data, val_data, stream_name=f"VAL(epoch={epoch})")
 
-        # Selection score: weighted average of raw recalls at selected FPRs
         r = val_out["raw_recalls"]
         val_score = 0.0
         for fpr_t, w in zip(SELECT_FPRS, SELECT_WEIGHTS):
@@ -438,7 +470,6 @@ def main():
         else:
             bad_epochs += 1
 
-        # Early stopping
         if epoch >= MIN_EPOCHS_BEFORE_STOP and bad_epochs >= EARLY_STOP_PATIENCE:
             print(f"Early stopping: no VAL score improvement for {EARLY_STOP_PATIENCE} epochs.")
             break
@@ -454,7 +485,12 @@ def main():
     _ = eval_stream(train_data, test_data, stream_name="TEST(best)")
 
     cfg_path = artifacts / f"tgn_{MODEL_VARIANT}_config.json"
-    cfg_path.write_text(json.dumps(ckpt["config"] | {"best_epoch": best_epoch, "best_val_score": best_score}, indent=2))
+    cfg_path.write_text(
+        json.dumps(
+            ckpt["config"] | {"best_epoch": best_epoch, "best_val_score": best_score},
+            indent=2,
+        )
+    )
     print("Saved config:", cfg_path)
 
 
