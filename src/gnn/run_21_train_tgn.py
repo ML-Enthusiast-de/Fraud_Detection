@@ -22,10 +22,20 @@ from torch_geometric.nn.models.tgn import (
 # =========================
 # CONFIG (tune here)
 # =========================
-MODEL_VARIANT = "behavioral"   # rename to "hybrid" if you want
+MODEL_VARIANT = "behavioral"
+
+# ---- SPLIT STRATEGY (KEY CHANGE) ----
+# Keep TRAIN as the first TRAIN_FRAC of time.
+# Then, within the remaining tail, choose the VAL/TEST boundary so TEST contains
+# the last TEST_FRAUD_TARGET frauds. This moves fraud into VAL (less noisy selection).
+TRAIN_FRAC = 0.70
+
+TEST_FRAUD_TARGET = 100     # how many frauds to keep in TEST (from the tail end)
+MIN_VAL_FRAUD = 80          # ensure VAL gets at least this many frauds (auto-adjust test target if needed)
+MIN_TEST_EVENTS = 10_000    # safety: avoid absurdly tiny test window (auto-adjust if needed)
 
 BATCH_SIZE = 2000
-EPOCHS = 25          # early stopping will stop earlier
+EPOCHS = 25
 LR = 1e-3
 
 MEMORY_DIM = 128
@@ -33,18 +43,17 @@ TIME_DIM = 64
 HEADS = 2
 EMB_DIM = 128  # must be divisible by HEADS
 
-NEIGHBOR_SIZE = 50   # good default on CPU; 100 can dilute top-of-list w/ few positives
+NEIGHBOR_SIZE = 50
 
 # Regularization / stability
 CLIP_GRAD_NORM = 1.0
 WEIGHT_DECAY = 1e-4
 
-# Focal loss for extreme imbalance
+# Loss
 USE_FOCAL = True
 FOCAL_GAMMA = 2.0
 
 # Checkpoint selection: weighted recall at fixed FPR budgets on VAL
-# (Slightly more stable than only low points because VAL has only 20 frauds.)
 SELECT_FPRS = (0.005, 0.01, 0.02, 0.05)      # 0.5%, 1%, 2%, 5%
 SELECT_WEIGHTS = (0.45, 0.25, 0.20, 0.10)    # sum to 1
 
@@ -54,7 +63,6 @@ MIN_EPOCHS_BEFORE_STOP = 3
 # Optional ops-style gate for reporting (does NOT affect training)
 ALLOWED_TYPES_GATE = {"TRANSFER", "CASH_OUT"}
 
-# Reproducibility (best-effort)
 SEED = 42
 # =========================
 
@@ -79,17 +87,13 @@ def focal_bce_with_logits(
 ) -> torch.Tensor:
     """
     Focal loss on top of BCEWithLogits, with pos_weight for class imbalance.
-
-    - BCE focuses on fitting probabilities overall.
-    - Focal downweights "easy" examples (pt ~ 1), focuses on hard ones.
     """
     bce = F.binary_cross_entropy_with_logits(
         logits, targets, pos_weight=pos_weight, reduction="none"
-    )  # [B]
-
+    )
     p = torch.sigmoid(logits)
-    pt = torch.where(targets > 0.5, p, 1.0 - p)  # probability of the true class
-    mod = (1.0 - pt).pow(gamma)                  # downweight easy examples
+    pt = torch.where(targets > 0.5, p, 1.0 - p)
+    mod = (1.0 - pt).pow(gamma)
     return (mod * bce).mean()
 
 
@@ -131,10 +135,72 @@ class EdgeClassifier(nn.Module):
         return self.net(x).view(-1)
 
 
-def time_split(num_events: int):
-    i1 = int(0.70 * num_events)
-    i2 = int(0.85 * num_events)
-    return i1, i2
+def split_train_tail_by_fraud(
+    y: np.ndarray,
+    n_events: int,
+    train_frac: float,
+    test_fraud_target: int,
+    min_val_fraud: int,
+    min_test_events: int,
+):
+    """
+    Time-ordered split:
+
+    TRAIN = [0, i1)
+    VAL   = [i1, i2)
+    TEST  = [i2, end)
+
+    Where i1 is fixed by train_frac, and i2 is chosen so that TEST contains the last
+    `test_fraud_target` frauds from the tail [i1, end).
+
+    This specifically fixes PaySim's "fraud spike at the very end" problem.
+    """
+    assert 0.0 < train_frac < 1.0
+    i1 = int(train_frac * n_events)
+
+    y_tail = y[i1:]
+    tail_fraud_idx = np.flatnonzero(y_tail == 1)
+    tail_fraud = int(len(tail_fraud_idx))
+
+    if tail_fraud == 0:
+        # No fraud in tail: fallback to simple 70/20/10 style split
+        i2 = int((train_frac + 0.20) * n_events)
+        return i1, i2, {
+            "mode": "fallback_frac",
+            "tail_fraud": tail_fraud,
+            "test_fraud_target_used": 0,
+        }
+
+    # Ensure VAL isn't starved: TEST cannot take so many frauds that VAL has < min_val_fraud
+    max_test_fraud = max(1, tail_fraud - min_val_fraud) if tail_fraud > min_val_fraud else max(1, tail_fraud // 2)
+    test_fraud_used = int(min(test_fraud_target, max_test_fraud))
+
+    # Pick i2 = position (in tail) where the last `test_fraud_used` frauds begin
+    start_in_tail = int(tail_fraud_idx[-test_fraud_used])
+    i2 = i1 + start_in_tail
+
+    # Safety: ensure TEST has at least min_test_events; if not, move boundary earlier.
+    test_events = n_events - i2
+    if test_events < min_test_events:
+        i2 = max(i1 + 1, n_events - min_test_events)
+        # recompute how many frauds ended up in TEST after forcing minimum size
+        test_fraud_after = int(y[i2:].sum())
+        info = {
+            "mode": "tail_fraud_with_min_test_events",
+            "tail_fraud": tail_fraud,
+            "test_fraud_target_used": test_fraud_used,
+            "test_events_forced": True,
+            "test_fraud_after_forcing": test_fraud_after,
+        }
+        return i1, i2, info
+
+    info = {
+        "mode": "tail_fraud",
+        "tail_fraud": tail_fraud,
+        "test_fraud_target_used": test_fraud_used,
+        "test_events_forced": False,
+    }
+    return i1, i2, info
 
 
 @torch.no_grad()
@@ -201,10 +267,32 @@ def main():
     data = TemporalData(src=src, dst=dst, t=t, msg=msg, y=y, type_id=type_id)
 
     n_events = data.num_events
-    i1, i2 = time_split(n_events)
+    y_np_all = data.y.cpu().numpy().astype(np.int64)
+
+    i1, i2, split_info = split_train_tail_by_fraud(
+        y=y_np_all,
+        n_events=n_events,
+        train_frac=TRAIN_FRAC,
+        test_fraud_target=TEST_FRAUD_TARGET,
+        min_val_fraud=MIN_VAL_FRAUD,
+        min_test_events=MIN_TEST_EVENTS,
+    )
+
     train_data = data[:i1]
     val_data = data[i1:i2]
     test_data = data[i2:]
+
+    def _split_stats(name: str, td: TemporalData):
+        yy = td.y.cpu().numpy()
+        print(f"{name}: events={len(td)} fraud={int(yy.sum())} rate={float(yy.mean()):.6f}")
+
+    print("\n=== TIME SPLIT (TRAIN fixed, VAL/TEST tail by fraud) ===")
+    print(f"TRAIN_FRAC={TRAIN_FRAC:.2f} | TEST_FRAUD_TARGET={TEST_FRAUD_TARGET} | MIN_VAL_FRAUD={MIN_VAL_FRAUD} | MIN_TEST_EVENTS={MIN_TEST_EVENTS}")
+    print("split_info:", split_info)
+    _split_stats("TRAIN", train_data)
+    _split_stats("VAL", val_data)
+    _split_stats("TEST", test_data)
+    print("======================================================\n")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
@@ -219,10 +307,8 @@ def main():
         aggregator_module=LastAggregator(),
     ).to(device)
 
-    # Keep last-K neighbors per node
     neighbor_loader = LastNeighborLoader(num_nodes=num_nodes, size=NEIGHBOR_SIZE, device=device)
 
-    # Neighborhood GNN edge_attr = [raw_msg, time_enc(age)]
     edge_dim = msg_dim + TIME_DIM
     embedder = TemporalGraphEmbedding(MEMORY_DIM, EMB_DIM, edge_dim=edge_dim, heads=HEADS).to(device)
     classifier = EdgeClassifier(EMB_DIM, msg_dim).to(device)
@@ -230,7 +316,7 @@ def main():
     params = list(memory.parameters()) + list(embedder.parameters()) + list(classifier.parameters())
     opt = torch.optim.Adam(params, lr=LR, weight_decay=WEIGHT_DECAY)
 
-    # ---- Class imbalance ----
+    # ---- Class imbalance on TRAIN only ----
     y_train = train_data.y.cpu().numpy()
     n_pos = int(y_train.sum())
     n_neg = int(len(y_train) - n_pos)
@@ -240,10 +326,7 @@ def main():
     print("train pos:", n_pos, "neg:", n_neg, "pos_weight:", float(pos_weight.item()))
 
     train_loader = TemporalDataLoader(train_data, batch_size=BATCH_SIZE)
-    val_loader = TemporalDataLoader(val_data, batch_size=BATCH_SIZE)
-    test_loader = TemporalDataLoader(test_data, batch_size=BATCH_SIZE)
 
-    # Node id -> local index mapping in sampled subgraph
     assoc = torch.empty(num_nodes, device=device, dtype=torch.long)
 
     def reset_state():
@@ -251,10 +334,6 @@ def main():
         neighbor_loader.reset_state()
 
     def batch_predict(batch: TemporalData, t_now: torch.Tensor):
-        """
-        Predict fraud logits for current batch WITHOUT updating memory with current batch.
-        Uses neighborhood graph built from already-inserted edges.
-        """
         seed = torch.cat([batch.src, batch.dst]).unique()
 
         # PyG signature: __call__(n_id)
@@ -267,16 +346,14 @@ def main():
         else:
             e_t = batch.t_all[e_id]
             age = (t_now - e_t).clamp_min(0).to(mem.dtype)
-            age_enc = memory.time_enc(age)         # [E, TIME_DIM]
-            e_msg = batch.msg_all[e_id]            # [E, msg_dim]
+            age_enc = memory.time_enc(age)
+            e_msg = batch.msg_all[e_id]
             e_attr = torch.cat([e_msg, age_enc], dim=-1)
-
             z = embedder(mem, edge_index, e_attr)
 
         assoc[n_id] = torch.arange(n_id.size(0), device=device)
         z_src = z[assoc[batch.src]]
         z_dst = z[assoc[batch.dst]]
-
         logits = classifier(z_src, z_dst, batch.msg)
         return logits
 
@@ -285,13 +362,12 @@ def main():
             return focal_bce_with_logits(logits, targets, pos_weight=pos_weight, gamma=FOCAL_GAMMA)
         return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
 
-    def train_one_epoch(epoch: int):
+    def train_one_epoch():
         memory.train()
         embedder.train()
         classifier.train()
         reset_state()
 
-        # During training, e_id indexes only into events inserted from the train stream
         train_t_all = train_data.t.to(device)
         train_msg_all = train_data.msg.to(device)
 
@@ -305,10 +381,8 @@ def main():
 
             opt.zero_grad(set_to_none=True)
 
-            # Predict BEFORE state update (no leakage)
             t_now = batch.t.max()
             logits = batch_predict(batch, t_now)
-
             loss = compute_loss(logits, batch.y.float())
             loss.backward()
 
@@ -317,10 +391,9 @@ def main():
 
             opt.step()
 
-            # Update AFTER scoring
+            # Update AFTER scoring (no leakage)
             memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
             neighbor_loader.insert(batch.src, batch.dst)
-
             memory.detach()
 
             bs = batch.num_events
@@ -331,13 +404,6 @@ def main():
 
     @torch.no_grad()
     def eval_stream(history: TemporalData, stream: TemporalData, stream_name: str):
-        """
-        Warm-up on history (build memory+neighbors), then score stream sequentially.
-
-        IMPORTANT:
-        neighbor_loader keeps e_id across history+stream inserts,
-        so we index into all_t/all_msg = cat(history, stream).
-        """
         memory.eval()
         embedder.eval()
         classifier.eval()
@@ -346,20 +412,16 @@ def main():
         all_t = torch.cat([history.t, stream.t]).to(device)
         all_msg = torch.cat([history.msg, stream.msg]).to(device)
 
-        # Warm-up on history
+        # warmup
         history_loader = TemporalDataLoader(history, batch_size=BATCH_SIZE)
         for batch in history_loader:
             batch = batch.to(device)
             memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
             neighbor_loader.insert(batch.src, batch.dst)
 
-        # Score stream
         stream_loader = TemporalDataLoader(stream, batch_size=BATCH_SIZE)
 
-        all_logits = []
-        all_y = []
-        all_type = []
-
+        all_logits, all_y, all_type = [], [], []
         for batch in stream_loader:
             batch = batch.to(device)
             batch.t_all = all_t
@@ -372,7 +434,6 @@ def main():
             all_y.append(batch.y.detach().cpu())
             all_type.append(batch.type_id.detach().cpu())
 
-            # Update AFTER scoring
             memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
             neighbor_loader.insert(batch.src, batch.dst)
 
@@ -400,13 +461,7 @@ def main():
             gated_score[~mask] = 0.0
             gated_recalls = print_ops(f"{stream_name} GATED {sorted(ALLOWED_TYPES_GATE)}", gated_score)
 
-        return {
-            "rows": int(len(y_true)),
-            "fraud": int(y_true.sum()),
-            "fraud_rate": float(y_true.mean()),
-            "raw_recalls": raw_recalls,
-            "gated_recalls": gated_recalls,
-        }
+        return {"raw_recalls": raw_recalls, "gated_recalls": gated_recalls}
 
     # ---- checkpoint selection ----
     best_path = artifacts / f"tgn_{MODEL_VARIANT}.pt"
@@ -416,6 +471,10 @@ def main():
 
     base_config = {
         "MODEL_VARIANT": MODEL_VARIANT,
+        "TRAIN_FRAC": TRAIN_FRAC,
+        "TEST_FRAUD_TARGET": TEST_FRAUD_TARGET,
+        "MIN_VAL_FRAUD": MIN_VAL_FRAUD,
+        "MIN_TEST_EVENTS": MIN_TEST_EVENTS,
         "BATCH_SIZE": BATCH_SIZE,
         "EPOCHS": EPOCHS,
         "LR": LR,
@@ -431,12 +490,14 @@ def main():
         "SELECT_FPRS": list(SELECT_FPRS),
         "SELECT_WEIGHTS": list(SELECT_WEIGHTS),
         "EARLY_STOP_PATIENCE": EARLY_STOP_PATIENCE,
+        "MIN_EPOCHS_BEFORE_STOP": MIN_EPOCHS_BEFORE_STOP,
         "SEED": SEED,
         "CLIP_GRAD_NORM": CLIP_GRAD_NORM,
+        "split_info": split_info,
     }
 
     for epoch in range(1, EPOCHS + 1):
-        loss = train_one_epoch(epoch)
+        loss = train_one_epoch()
         print(f"epoch {epoch}/{EPOCHS} train_loss: {loss:.6f}")
 
         val_out = eval_stream(train_data, val_data, stream_name=f"VAL(epoch={epoch})")
